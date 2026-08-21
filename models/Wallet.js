@@ -26,6 +26,13 @@ const WalletSchema = new mongoose.Schema({
     expectedSignerCount: Number,
     lastBalance: String,
 
+    // Set by services/claimScheduler.js's discoverForWallet() every time it checks this
+    // wallet for claimable balances - null on success, an error message on failure (e.g.
+    // "no destination address set", or a Horizon error). This is what lets the dashboard
+    // show real proof of whether discovery ran and what it found, instead of the wallet
+    // just sitting there with only a balance and no way to tell if anything happened.
+    lastDiscoveryError: String,
+
     // Set by services/walletMonitor.js when activity is seen that our own scheduler
     // didn't initiate. Surfaced in the dashboard as a red flag for that wallet.
     flagged: { type: Boolean, default: false },

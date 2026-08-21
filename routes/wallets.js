@@ -9,6 +9,8 @@
 
 import express from 'express';
 import Wallet from '../models/Wallet.js';
+import ClaimableBalance from '../models/ClaimableBalance.js';
+import Settings from '../models/Settings.js';
 import AuditLog from '../models/AuditLog.js';
 import { encryptSecret, decryptSecret } from '../lib/crypto.js';
 import {
@@ -17,6 +19,7 @@ import {
     getAccount,
     getNativeBalance,
 } from '../lib/stellar.js';
+import { discoverForWallet } from '../services/claimScheduler.js';
 
 const router = express.Router();
 
@@ -25,15 +28,33 @@ router.post('/', async (req, res) => {
 
     // Accept either field name - "mnemonic" for back-compat with earlier requests, or
     // "secretKey" when adding via a raw secret key. Whichever is present wins.
-    const credential = secretKey || mnemonic;
+    const rawCredential = secretKey || mnemonic;
 
-    if (!credential) return res.status(400).json({ error: 'mnemonic or secretKey is required' });
+    if (!rawCredential) return res.status(400).json({ error: 'mnemonic or secretKey is required' });
     if (!label) return res.status(400).json({ error: 'label is required' });
 
-    const credentialType = explicitType || (secretKey ? 'secret' : detectCredentialType(credential));
+    const credentialType = explicitType || (secretKey ? 'secret' : detectCredentialType(rawCredential));
+
+    // Secret keys are case-sensitive base32 and canonically UPPERCASE - normalize so a
+    // key copied from somewhere that displays it lowercase (or with stray whitespace)
+    // still parses instead of failing with an opaque "invalid encoded string" error.
+    const credential = credentialType === 'secret'
+        ? rawCredential.trim().toUpperCase()
+        : rawCredential.trim();
+
+    let kp;
+    try {
+        kp = getKeypairFromCredential(credential, credentialType);
+    } catch (err) {
+        // Give a specific, actionable reason instead of a generic failure - this is what
+        // was getting swallowed before and made secret-key uploads look silently broken.
+        const hint = credentialType === 'secret'
+            ? 'That doesn\'t look like a valid secret key - it should be exactly 56 characters and start with "S".'
+            : 'That doesn\'t look like a valid 24-word recovery phrase.';
+        return res.status(400).json({ error: hint, detail: err.message });
+    }
 
     try {
-        const kp = getKeypairFromCredential(credential, credentialType);
         const publicKey = kp.publicKey();
 
         const existing = await Wallet.findOne({ publicKey });
@@ -65,6 +86,13 @@ router.post('/', async (req, res) => {
             detail: `Added wallet "${label}" (${wallet.role}, via ${credentialType})`,
         });
 
+        // If this is a "main" wallet, check for claimable balances immediately instead of
+        // making you wait for the next background poll (up to a minute) to find out.
+        if (wallet.role === 'main') {
+            const settings = await Settings.getSingleton();
+            await discoverForWallet(wallet, settings);
+        }
+
         res.status(201).json({
             id: wallet._id,
             label: wallet.label,
@@ -78,8 +106,14 @@ router.post('/', async (req, res) => {
 });
 
 router.get('/', async (req, res) => {
-    const wallets = await Wallet.find().sort({ createdAt: -1 });
-    res.json(wallets);
+    const wallets = await Wallet.find().sort({ createdAt: -1 }).lean();
+
+    const counts = await ClaimableBalance.aggregate([
+        { $group: { _id: '$walletId', count: { $sum: 1 } } },
+    ]);
+    const countByWallet = Object.fromEntries(counts.map((c) => [String(c._id), c.count]));
+
+    res.json(wallets.map((w) => ({ ...w, claimableCount: countByWallet[String(w._id)] || 0 })));
 });
 
 router.delete('/:id', async (req, res) => {
@@ -109,6 +143,21 @@ router.get('/:id/balance', async (req, res) => {
     } catch (err) {
         res.status(502).json({ error: 'Failed to fetch balance from Horizon', detail: err.message });
     }
+});
+
+// Manual, synchronous "check now" - returns a real answer immediately (found N, or the
+// exact error) instead of waiting on the background poll and checking a different tab.
+router.post('/:id/check-claimable', async (req, res) => {
+    const wallet = await Wallet.findById(req.params.id);
+    if (!wallet) return res.status(404).json({ error: 'Not found' });
+
+    const settings = await Settings.getSingleton();
+    const result = await discoverForWallet(wallet, settings);
+
+    if (!result.ok) {
+        return res.status(422).json(result);
+    }
+    res.json(result);
 });
 
 // Used internally elsewhere in the backend - not exported to the public API surface

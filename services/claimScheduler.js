@@ -56,50 +56,76 @@ async function pickFunder(minBalance) {
     return null;
 }
 
+/**
+ * Check ONE wallet against Horizon for claimable balances, right now, and return exactly
+ * what happened - used by both the background loop below AND routes/wallets.js's manual
+ * "check now" button, so a single click gets a real, immediate answer instead of "wait
+ * up to a minute and go look at a different tab."
+ */
+export async function discoverForWallet(wallet, settings) {
+    if (!settings.destinationAddress) {
+        const msg = 'No destination address is set in Settings - discovery is disabled until you set one.';
+        wallet.lastDiscoveryError = msg;
+        await wallet.save();
+        return { ok: false, error: msg };
+    }
+
+    try {
+        const records = await getClaimableBalancesFor(wallet.publicKey);
+        let newlyAdded = 0;
+
+        for (const record of records) {
+            const existing = await ClaimableBalance.findOne({ balanceId: record.id });
+            if (existing) continue;
+
+            await ClaimableBalance.create({
+                walletId: wallet._id,
+                balanceId: record.id,
+                amount: record.amount,
+                claimableAt: findClaimableAt(record, wallet.publicKey),
+                destination: settings.destinationAddress,
+            });
+
+            await AuditLog.create({
+                walletId: wallet._id,
+                action: 'claimable_discovered',
+                detail: `Found claimable balance ${record.id} for ${record.amount} Pi`,
+            });
+            newlyAdded++;
+        }
+
+        wallet.lastCheckedAt = new Date();
+        wallet.lastDiscoveryError = null;
+        await wallet.save();
+
+        return { ok: true, totalFound: records.length, newlyAdded };
+    } catch (err) {
+        wallet.lastCheckedAt = new Date();
+        wallet.lastDiscoveryError = err.message;
+        await wallet.save();
+
+        await AuditLog.create({
+            walletId: wallet._id,
+            action: 'discover_claimables_failed',
+            level: 'error',
+            detail: err.message,
+        });
+
+        return { ok: false, error: err.message };
+    }
+}
+
 export async function discoverClaimables() {
     if (discovering) return;
     discovering = true;
 
     try {
         const settings = await Settings.getSingleton();
-        if (!settings.destinationAddress) {
-            return; // nothing to do until you set a destination in Settings
-        }
-
         const mainWallets = await Wallet.find({ role: 'main' });
         const limit = pLimit(settings.maxConcurrency || 5);
 
         await Promise.all(mainWallets.map((wallet) => limit(async () => {
-            try {
-                const records = await getClaimableBalancesFor(wallet.publicKey);
-                for (const record of records) {
-                    const existing = await ClaimableBalance.findOne({ balanceId: record.id });
-                    if (existing) continue;
-
-                    await ClaimableBalance.create({
-                        walletId: wallet._id,
-                        balanceId: record.id,
-                        amount: record.amount,
-                        claimableAt: findClaimableAt(record, wallet.publicKey),
-                        destination: settings.destinationAddress,
-                    });
-
-                    await AuditLog.create({
-                        walletId: wallet._id,
-                        action: 'claimable_discovered',
-                        detail: `Found claimable balance ${record.id} for ${record.amount} Pi`,
-                    });
-                }
-                wallet.lastCheckedAt = new Date();
-                await wallet.save();
-            } catch (err) {
-                await AuditLog.create({
-                    walletId: wallet._id,
-                    action: 'discover_claimables_failed',
-                    level: 'error',
-                    detail: err.message,
-                });
-            }
+            await discoverForWallet(wallet, settings);
             await sleep(200 + Math.random() * 300); // small jitter, not evasion - just spacing
         })));
     } finally {
