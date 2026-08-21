@@ -73,8 +73,11 @@ export async function discoverForWallet(wallet, settings) {
     try {
         const records = await getClaimableBalancesFor(wallet.publicKey);
         let newlyAdded = 0;
+        let totalAmountFound = 0;
 
         for (const record of records) {
+            totalAmountFound += parseFloat(record.amount) || 0;
+
             const existing = await ClaimableBalance.findOne({ balanceId: record.id });
             if (existing) continue;
 
@@ -98,7 +101,10 @@ export async function discoverForWallet(wallet, settings) {
         wallet.lastDiscoveryError = null;
         await wallet.save();
 
-        return { ok: true, totalFound: records.length, newlyAdded };
+        // totalAmountFound reflects what's on-chain for this wallet RIGHT NOW (Horizon's
+        // live answer) - not just the sum of rows already in our DB - so a check-now click
+        // always shows a real, current number even before/without a page reload.
+        return { ok: true, totalFound: records.length, newlyAdded, totalAmountFound };
     } catch (err) {
         wallet.lastCheckedAt = new Date();
         wallet.lastDiscoveryError = err.message;

@@ -108,12 +108,23 @@ router.post('/', async (req, res) => {
 router.get('/', async (req, res) => {
     const wallets = await Wallet.find().sort({ createdAt: -1 }).lean();
 
-    const counts = await ClaimableBalance.aggregate([
-        { $group: { _id: '$walletId', count: { $sum: 1 } } },
+    // Only count balances that are still actually outstanding - once something is
+    // successfully claimed it shouldn't keep inflating the "N claimable" badge forever.
+    // amount is stored as a String (raw Horizon value), so $toDouble it to sum properly.
+    const stats = await ClaimableBalance.aggregate([
+        { $match: { status: { $in: ['pending', 'claiming', 'failed'] } } },
+        { $group: { _id: '$walletId', count: { $sum: 1 }, totalPi: { $sum: { $toDouble: '$amount' } } } },
     ]);
-    const countByWallet = Object.fromEntries(counts.map((c) => [String(c._id), c.count]));
+    const statsByWallet = Object.fromEntries(stats.map((s) => [String(s._id), s]));
 
-    res.json(wallets.map((w) => ({ ...w, claimableCount: countByWallet[String(w._id)] || 0 })));
+    res.json(wallets.map((w) => {
+        const s = statsByWallet[String(w._id)];
+        return {
+            ...w,
+            claimableCount: s?.count || 0,
+            claimablePiTotal: s?.totalPi || 0,
+        };
+    }));
 });
 
 router.delete('/:id', async (req, res) => {
