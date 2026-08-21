@@ -24,13 +24,14 @@ router.post('/', async (req, res) => {
             ? { _id: { $in: walletIds } }
             : {};
 
-        const wallets = await Wallet.find(query).select('+mnemonicEncrypted');
+        const wallets = await Wallet.find(query).select('+credentialEncrypted');
 
         const payload = wallets.map((w) => ({
             label: w.label,
             role: w.role,
             publicKey: w.publicKey,
-            mnemonic: decryptSecret(w.mnemonicEncrypted),
+            credentialType: w.credentialType,
+            credential: decryptSecret(w.credentialEncrypted),
         }));
 
         const encrypted = encryptWithPassword(JSON.stringify({ exportedAt: new Date().toISOString(), wallets: payload }), password);

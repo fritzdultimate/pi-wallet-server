@@ -36,6 +36,28 @@ const SettingsSchema = new mongoose.Schema({
 
     minFunderBalance: { type: Number, default: 1 },
 
+    // How many DIFFERENT due claims processDueClaims() will work on at once. Each claim
+    // is still only ever submitted once - this is throughput across distinct claims, not
+    // duplicate submissions of the same one (see services/claimScheduler.js). Two claims
+    // that land on the same funder wallet are still serialized relative to each other,
+    // since Stellar accounts can't process two transactions from the same sequence number
+    // at once - only claims using DIFFERENT funders actually run in parallel.
+    maxConcurrentClaims: { type: Number, default: 5, min: 1, max: 50 },
+
+    // Pre-funding: how many minutes before a claim becomes due should the scheduler make
+    // sure a funder wallet is topped up in advance, using a "reserve" role wallet.
+    funderPrefundEnabled: { type: Boolean, default: false },
+    funderLeadTimeMinutes: { type: Number, default: 25 },
+
+    // Continuous sweep: periodically move balances from your "main" wallets to
+    // destinationAddress in batches, rather than waiting on the claim flow.
+    sweepEnabled: { type: Boolean, default: false },
+    sweepIntervalMs: { type: Number, default: 5 * 60_000 },
+    sweepBatchSize: { type: Number, default: 10 },
+    // Leave at least this much Pi behind in a swept wallet (covers Stellar's minimum
+    // account reserve so the sweep never fails by trying to drain an account to zero).
+    sweepReserveMinimum: { type: Number, default: 1 },
+
     telegramAlertsEnabled: { type: Boolean, default: false },
 }, {
     timestamps: { createdAt: 'createdAt', updatedAt: 'updatedAt' },

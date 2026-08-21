@@ -12,7 +12,10 @@ router.get('/', async (req, res) => {
 router.put('/', async (req, res) => {
     const allowed = [
         'destinationAddress', 'feeMode', 'extraFee', 'fixedFeePi', 'pollIntervalMs',
-        'maxConcurrency', 'minFunderBalance', 'telegramAlertsEnabled',
+        'maxConcurrency', 'minFunderBalance', 'maxConcurrentClaims',
+        'funderPrefundEnabled', 'funderLeadTimeMinutes',
+        'sweepEnabled', 'sweepIntervalMs', 'sweepBatchSize', 'sweepReserveMinimum',
+        'telegramAlertsEnabled',
     ];
     const updates = {};
     for (const key of allowed) {

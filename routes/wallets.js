@@ -1,25 +1,39 @@
 // routes/wallets.js
 //
 // Every route here is mounted behind requireAuth in server.js. There is deliberately no
-// public/unauthenticated route anywhere in this app that accepts a mnemonic - adding a
+// public/unauthenticated route anywhere in this app that accepts a credential - adding a
 // wallet always means YOU, logged in, adding a wallet you hold the keys to.
+//
+// Accepts either a 24-word mnemonic OR a raw secret key (starts with "S") - whichever you
+// paste in. Auto-detected if you don't specify credentialType explicitly.
 
 import express from 'express';
 import Wallet from '../models/Wallet.js';
 import AuditLog from '../models/AuditLog.js';
 import { encryptSecret, decryptSecret } from '../lib/crypto.js';
-import { getKeypairFromMnemonic, getAccount, getNativeBalance } from '../lib/stellar.js';
+import {
+    getKeypairFromCredential,
+    detectCredentialType,
+    getAccount,
+    getNativeBalance,
+} from '../lib/stellar.js';
 
 const router = express.Router();
 
 router.post('/', async (req, res) => {
-    const { label, role, mnemonic } = req.body;
+    const { label, role, mnemonic, secretKey, credentialType: explicitType } = req.body;
 
-    if (!mnemonic) return res.status(400).json({ error: 'mnemonic is required' });
+    // Accept either field name - "mnemonic" for back-compat with earlier requests, or
+    // "secretKey" when adding via a raw secret key. Whichever is present wins.
+    const credential = secretKey || mnemonic;
+
+    if (!credential) return res.status(400).json({ error: 'mnemonic or secretKey is required' });
     if (!label) return res.status(400).json({ error: 'label is required' });
 
+    const credentialType = explicitType || (secretKey ? 'secret' : detectCredentialType(credential));
+
     try {
-        const kp = getKeypairFromMnemonic(mnemonic);
+        const kp = getKeypairFromCredential(credential, credentialType);
         const publicKey = kp.publicKey();
 
         const existing = await Wallet.findOne({ publicKey });
@@ -37,9 +51,10 @@ router.post('/', async (req, res) => {
 
         const wallet = await Wallet.create({
             label,
-            role: role === 'funder' ? 'funder' : 'main',
+            role: ['main', 'funder', 'reserve'].includes(role) ? role : 'main',
             publicKey,
-            mnemonicEncrypted: encryptSecret(mnemonic),
+            credentialEncrypted: encryptSecret(credential),
+            credentialType,
             lastBalance,
             lastCheckedAt: new Date(),
         });
@@ -47,7 +62,7 @@ router.post('/', async (req, res) => {
         await AuditLog.create({
             walletId: wallet._id,
             action: 'wallet_added',
-            detail: `Added wallet "${label}" (${role || 'main'})`,
+            detail: `Added wallet "${label}" (${wallet.role}, via ${credentialType})`,
         });
 
         res.status(201).json({
@@ -96,12 +111,12 @@ router.get('/:id/balance', async (req, res) => {
     }
 });
 
-// Used internally by /api/backup and /api/cosign - not exported to the public API surface
+// Used internally elsewhere in the backend - not exported to the public API surface
 // beyond this authenticated router. Kept here so decryption stays close to the model.
-export async function decryptWalletMnemonic(walletId) {
-    const wallet = await Wallet.findById(walletId).select('+mnemonicEncrypted');
+export async function decryptWalletCredential(walletId) {
+    const wallet = await Wallet.findById(walletId).select('+credentialEncrypted');
     if (!wallet) throw new Error('Wallet not found');
-    return decryptSecret(wallet.mnemonicEncrypted);
+    return { credential: decryptSecret(wallet.credentialEncrypted), credentialType: wallet.credentialType };
 }
 
 export default router;

@@ -8,7 +8,7 @@ import express from 'express';
 import Wallet from '../models/Wallet.js';
 import AuditLog from '../models/AuditLog.js';
 import { decryptSecret } from '../lib/crypto.js';
-import { getKeypairFromMnemonic, coSignXdr, submitTransaction } from '../lib/stellar.js';
+import { getKeypairFromCredential, coSignXdr, submitTransaction } from '../lib/stellar.js';
 
 const router = express.Router();
 
@@ -18,11 +18,11 @@ router.post('/', async (req, res) => {
     if (!walletId) return res.status(400).json({ error: 'walletId is required' });
 
     try {
-        const wallet = await Wallet.findById(walletId).select('+mnemonicEncrypted');
+        const wallet = await Wallet.findById(walletId).select('+credentialEncrypted');
         if (!wallet) return res.status(404).json({ error: 'Wallet not found' });
 
-        const mnemonic = decryptSecret(wallet.mnemonicEncrypted);
-        const kp = getKeypairFromMnemonic(mnemonic);
+        const credential = decryptSecret(wallet.credentialEncrypted);
+        const kp = getKeypairFromCredential(credential, wallet.credentialType);
 
         const signedXdr = coSignXdr(xdr, kp);
 

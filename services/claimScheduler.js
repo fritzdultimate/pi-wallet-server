@@ -7,6 +7,14 @@
 //  2. processDueClaims() - for balances whose claimableAt has passed, actually build,
 //     sign (main wallet + a funder wallet to cover fees), and submit the claim.
 //
+// processDueClaims() runs up to settings.maxConcurrentClaims DIFFERENT claims at once.
+// Each claim is still only ever submitted once - this is throughput across distinct
+// claims, not the old repo's "flood the same claim N times to win a race" pattern, which
+// doesn't apply here anyway since you're the sole named claimant on your own balances.
+// Claims sharing a funder wallet are serialized relative to each other via
+// runSerializedByKey(), because two transactions can't share one account's sequence
+// number at the same time - only claims using DIFFERENT funders truly run in parallel.
+//
 // Every attempt writes an AuditLog row, success or failure, no exceptions.
 
 import pLimit from 'p-limit';
@@ -15,10 +23,11 @@ import ClaimableBalance from '../models/ClaimableBalance.js';
 import Settings from '../models/Settings.js';
 import AuditLog from '../models/AuditLog.js';
 import { decryptSecret } from '../lib/crypto.js';
+import { runSerializedByKey } from '../lib/keyedQueue.js';
 import {
     getClaimableBalancesFor,
     findClaimableAt,
-    getKeypairFromMnemonic,
+    getKeypairFromCredential,
     getAccount,
     getNativeBalance,
     buildClaimAndForwardTx,
@@ -98,6 +107,93 @@ export async function discoverClaimables() {
     }
 }
 
+async function processOneClaim(claim, settings) {
+    const funder = await pickFunder(settings.minFunderBalance || 1);
+    if (!funder) {
+        await AuditLog.create({
+            action: 'claim_skipped_no_funder',
+            level: 'warn',
+            detail: `No funder wallet with sufficient balance to cover fees for ${claim.balanceId}`,
+        });
+        return;
+    }
+
+    // Everything from here on touches `funder`'s sequence number - serialize against any
+    // other claim currently using the same funder, so they never collide.
+    await runSerializedByKey(String(funder._id), async () => {
+        claim.status = 'claiming';
+        await claim.save();
+
+        try {
+            const mainWalletFull = await Wallet.findById(claim.walletId._id).select('+credentialEncrypted');
+            const funderWalletFull = await Wallet.findById(funder._id).select('+credentialEncrypted');
+
+            const mainKp = getKeypairFromCredential(
+                decryptSecret(mainWalletFull.credentialEncrypted),
+                mainWalletFull.credentialType
+            );
+            const funderKp = getKeypairFromCredential(
+                decryptSecret(funderWalletFull.credentialEncrypted),
+                funderWalletFull.credentialType
+            );
+
+            const feePerOperationStroops = await resolveFeePerOperationStroops({
+                feeMode: settings.feeMode,
+                extraFeePi: settings.extraFee,
+                fixedFeePi: settings.fixedFeePi,
+            });
+
+            const xdr = await buildClaimAndForwardTx({
+                mainKp,
+                funderKp,
+                balanceId: claim.balanceId,
+                destination: claim.destination,
+                amount: claim.amount,
+                feePerOperationStroops,
+            });
+
+            const result = await submitTransaction(xdr);
+
+            // We are the tx source (funder) - record the sequence we now expect, so
+            // walletMonitor.js can tell if this funder account moves outside of us.
+            const freshFunder = await getAccount(funderKp.publicKey());
+            funder.lastKnownSequence = freshFunder.sequence;
+            await funder.save();
+
+            if (result.success && result.hash) {
+                claim.status = 'claimed';
+                claim.txHash = result.hash;
+                claim.claimedAt = new Date();
+                await AuditLog.create({
+                    walletId: claim.walletId._id,
+                    action: 'claim_succeeded',
+                    detail: `Claimed ${claim.amount} Pi -> ${claim.destination}. Hash: ${result.hash}`,
+                });
+            } else {
+                claim.status = 'failed';
+                claim.lastError = JSON.stringify(result.reason || result.message || 'unknown error');
+                await AuditLog.create({
+                    walletId: claim.walletId._id,
+                    action: 'claim_failed',
+                    level: 'error',
+                    detail: claim.lastError,
+                });
+            }
+            await claim.save();
+        } catch (err) {
+            claim.status = 'failed';
+            claim.lastError = err.message;
+            await claim.save();
+            await AuditLog.create({
+                walletId: claim.walletId._id,
+                action: 'claim_failed',
+                level: 'error',
+                detail: err.message,
+            });
+        }
+    });
+}
+
 export async function processDueClaims() {
     if (processing) return;
     processing = true;
@@ -109,86 +205,13 @@ export async function processDueClaims() {
             $or: [{ claimableAt: null }, { claimableAt: { $lte: new Date() } }],
         }).populate('walletId');
 
-        for (const claim of due) {
-            if (!claim.walletId) continue;
+        const limit = pLimit(settings.maxConcurrentClaims || 5);
 
-            const funder = await pickFunder(settings.minFunderBalance || 1);
-            if (!funder) {
-                await AuditLog.create({
-                    action: 'claim_skipped_no_funder',
-                    level: 'warn',
-                    detail: `No funder wallet with sufficient balance to cover fees for ${claim.balanceId}`,
-                });
-                continue;
-            }
-
-            claim.status = 'claiming';
-            await claim.save();
-
-            try {
-                const mainWalletFull = await Wallet.findById(claim.walletId._id).select('+mnemonicEncrypted');
-                const funderWalletFull = await Wallet.findById(funder._id).select('+mnemonicEncrypted');
-                const mainMnemonic = decryptSecret(mainWalletFull.mnemonicEncrypted);
-                const funderMnemonic = decryptSecret(funderWalletFull.mnemonicEncrypted);
-
-                const mainKp = getKeypairFromMnemonic(mainMnemonic);
-                const funderKp = getKeypairFromMnemonic(funderMnemonic);
-
-                const feePerOperationStroops = await resolveFeePerOperationStroops({
-                    feeMode: settings.feeMode,
-                    extraFeePi: settings.extraFee,
-                    fixedFeePi: settings.fixedFeePi,
-                });
-
-                const xdr = await buildClaimAndForwardTx({
-                    mainKp,
-                    funderKp,
-                    balanceId: claim.balanceId,
-                    destination: claim.destination,
-                    amount: claim.amount,
-                    feePerOperationStroops,
-                });
-
-                const result = await submitTransaction(xdr);
-
-                // We are the tx source (funder) - record the sequence we now expect, so
-                // walletMonitor.js can tell if this funder account moves outside of us.
-                const freshFunder = await getAccount(funderKp.publicKey());
-                funder.lastKnownSequence = freshFunder.sequence;
-                await funder.save();
-
-                if (result.success && result.hash) {
-                    claim.status = 'claimed';
-                    claim.txHash = result.hash;
-                    claim.claimedAt = new Date();
-                    await AuditLog.create({
-                        walletId: claim.walletId._id,
-                        action: 'claim_succeeded',
-                        detail: `Claimed ${claim.amount} Pi -> ${claim.destination}. Hash: ${result.hash}`,
-                    });
-                } else {
-                    claim.status = 'failed';
-                    claim.lastError = JSON.stringify(result.reason || result.message || 'unknown error');
-                    await AuditLog.create({
-                        walletId: claim.walletId._id,
-                        action: 'claim_failed',
-                        level: 'error',
-                        detail: claim.lastError,
-                    });
-                }
-                await claim.save();
-            } catch (err) {
-                claim.status = 'failed';
-                claim.lastError = err.message;
-                await claim.save();
-                await AuditLog.create({
-                    walletId: claim.walletId._id,
-                    action: 'claim_failed',
-                    level: 'error',
-                    detail: err.message,
-                });
-            }
-        }
+        await Promise.all(
+            due
+                .filter((claim) => claim.walletId)
+                .map((claim) => limit(() => processOneClaim(claim, settings)))
+        );
     } finally {
         processing = false;
     }

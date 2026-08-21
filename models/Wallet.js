@@ -1,6 +1,6 @@
 // models/Wallet.js
 //
-// A wallet YOU add. mnemonicEncrypted is only ever decrypted transiently in-memory to
+// A wallet YOU add. credentialEncrypted is only ever decrypted transiently in-memory to
 // sign a transaction. There is no field anywhere for "who submitted this" separate from
 // the single owner of this deployment - this app is single-tenant by design.
 
@@ -8,9 +8,17 @@ import mongoose from 'mongoose';
 
 const WalletSchema = new mongoose.Schema({
     label: { type: String, required: true, trim: true },
-    role: { type: String, enum: ['main', 'funder'], default: 'main' },
+    // main    - a wallet whose claimable balances you want claimed
+    // funder  - pays network fees for claim transactions
+    // reserve - the source pre-funding tops funders up from, ahead of time
+    role: { type: String, enum: ['main', 'funder', 'reserve'], default: 'main' },
     publicKey: { type: String, required: true, unique: true },
-    mnemonicEncrypted: { type: String, required: true, select: false }, // AES-256-GCM, see lib/crypto.js
+
+    // Either a 24-word mnemonic or a raw Stellar/Pi secret key (starts with "S"). Stored
+    // encrypted at rest either way - see lib/crypto.js. credentialType tells us how to
+    // turn it back into a signing keypair.
+    credentialEncrypted: { type: String, required: true, select: false },
+    credentialType: { type: String, enum: ['mnemonic', 'secret'], default: 'mnemonic' },
 
     // Bookkeeping populated by background jobs - never by an external caller.
     lastCheckedAt: Date,

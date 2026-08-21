@@ -10,7 +10,7 @@ import Settings from '../models/Settings.js';
 import AuditLog from '../models/AuditLog.js';
 import { decryptSecret } from '../lib/crypto.js';
 import {
-    getKeypairFromMnemonic,
+    getKeypairFromCredential,
     buildPaymentTx,
     submitTransaction,
     resolveFeePerOperationStroops,
@@ -41,7 +41,7 @@ router.post('/send', async (req, res) => {
     if (!amount || Number(amount) <= 0) return res.status(400).json({ error: 'A valid amount is required' });
 
     try {
-        const wallet = await Wallet.findById(fromWalletId).select('+mnemonicEncrypted');
+        const wallet = await Wallet.findById(fromWalletId).select('+credentialEncrypted');
         if (!wallet) return res.status(404).json({ error: 'Wallet not found' });
 
         const settings = await Settings.getSingleton();
@@ -51,8 +51,8 @@ router.post('/send', async (req, res) => {
             fixedFeePi: settings.fixedFeePi,
         });
 
-        const mnemonic = decryptSecret(wallet.mnemonicEncrypted);
-        const fromKp = getKeypairFromMnemonic(mnemonic);
+        const credential = decryptSecret(wallet.credentialEncrypted);
+        const fromKp = getKeypairFromCredential(credential, wallet.credentialType);
 
         const xdr = await buildPaymentTx({ fromKp, destination, amount: String(amount), feePerOperationStroops });
         const result = await submitTransaction(xdr);
