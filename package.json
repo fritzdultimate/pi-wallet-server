@@ -1,0 +1,28 @@
+{
+  "name": "pi-wallet-server",
+  "version": "1.0.0",
+  "description": "Personal, single-owner Pi/Stellar wallet manager backend. Manages only wallets you add yourself; never accepts another user's mnemonic or an arbitrary caller-supplied payout address.",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.10.0",
+    "bcryptjs": "^2.4.3",
+    "bip39": "^3.1.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.5.0",
+    "ed25519-hd-key": "^1.3.0",
+    "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.16.0",
+    "node-cron": "^3.0.3",
+    "node-telegram-bot-api": "^0.66.0",
+    "p-limit": "^6.2.0",
+    "stellar-base": "^13.1.0"
+  }
+}
