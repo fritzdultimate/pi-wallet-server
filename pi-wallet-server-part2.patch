@@ -1,0 +1,154 @@
+diff --git a/lib/stellar.js b/lib/stellar.js
+index 15aa774..7814ea1 100644
+--- a/lib/stellar.js
++++ b/lib/stellar.js
+@@ -74,14 +74,100 @@ export async function getClaimableBalancesFor(publicKey) {
+     return res.data?._embedded?.records ?? [];
+ }
+ 
+-export async function getRecentOperations(publicKey, limit = 10) {
++/**
++ * Raw Horizon operation records for one account, newest first, optionally continuing
++ * from a previous page via `cursor` (a `paging_token` from an earlier record - the same
++ * cursor scheme Horizon uses everywhere). Used by routes/wallets.js's transaction history
++ * endpoint to page arbitrarily far back ("seek till the end") without ever loading more
++ * than one page at a time.
++ */
++export async function getRecentOperations(publicKey, limit = 10, cursor) {
+     const res = await axios.get(`${horizonUrl()}/accounts/${publicKey}/operations`, {
+-        params: { limit, order: 'desc' },
++        params: { limit, order: 'desc', ...(cursor ? { cursor } : {}) },
+         timeout: 15_000,
+     });
+     return res.data?._embedded?.records ?? [];
+ }
+ 
++const OPERATION_LABELS = {
++    create_account: 'Account created',
++    payment: 'Payment',
++    claim_claimable_balance: 'Claimed balance',
++    create_claimable_balance: 'Created claimable balance',
++    account_merge: 'Account merged',
++    set_options: 'Account options changed',
++    change_trust: 'Trustline changed',
++    manage_data: 'Data entry changed',
++    bump_sequence: 'Sequence bumped',
++};
++
++function titleCaseType(type) {
++    return (type || 'operation').replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
++}
++
++/**
++ * Turn a page of raw, wildly-shaped Horizon operation records into one consistent shape
++ * the dashboard's wallet detail view can render without knowing Stellar's operation
++ * schema - direction/amount/counterparty are resolved relative to `ownerPublicKey` so
++ * "sent" vs "received" is always from THIS wallet's point of view.
++ */
++export function normalizeOperations(records, ownerPublicKey) {
++    return records.map((op) => {
++        const base = {
++            id: op.id,
++            pagingToken: op.paging_token,
++            type: op.type,
++            label: OPERATION_LABELS[op.type] || titleCaseType(op.type),
++            createdAt: op.created_at,
++            successful: op.transaction_successful !== false,
++            txHash: op.transaction_hash,
++            amount: null,
++            asset: null,
++            direction: 'neutral',
++            counterparty: null,
++        };
++
++        switch (op.type) {
++            case 'payment': {
++                const outgoing = op.from === ownerPublicKey;
++                return {
++                    ...base,
++                    amount: op.amount,
++                    asset: op.asset_type === 'native' ? 'PI' : (op.asset_code || op.asset_type),
++                    direction: outgoing ? 'out' : 'in',
++                    counterparty: outgoing ? op.to : op.from,
++                    label: outgoing ? 'Sent' : 'Received',
++                };
++            }
++            case 'create_account': {
++                const isFunder = op.funder === ownerPublicKey;
++                return {
++                    ...base,
++                    amount: op.starting_balance,
++                    asset: 'PI',
++                    direction: isFunder ? 'out' : 'in',
++                    counterparty: isFunder ? op.account : op.funder,
++                    label: isFunder ? 'Funded new account' : 'Account created',
++                };
++            }
++            case 'claim_claimable_balance':
++                return { ...base, direction: 'in', label: 'Claimed balance' };
++            case 'create_claimable_balance':
++                return {
++                    ...base,
++                    amount: op.amount,
++                    asset: op.asset === 'native' ? 'PI' : op.asset,
++                    direction: 'out',
++                    label: 'Created claimable balance',
++                };
++            case 'account_merge':
++                return { ...base, direction: 'out', counterparty: op.into, label: 'Account merged into' };
++            default:
++                return base;
++        }
++    });
++}
++
+ let cachedFee = null;
+ let cachedFeeAt = 0;
+ const FEE_CACHE_TTL_MS = 10_000;
+diff --git a/routes/wallets.js b/routes/wallets.js
+index c497783..0b86519 100644
+--- a/routes/wallets.js
++++ b/routes/wallets.js
+@@ -19,6 +19,8 @@ import {
+     getAccount,
+     getNativeBalance,
+     getMinAccountReservePi,
++    getRecentOperations,
++    normalizeOperations,
+ } from '../lib/stellar.js';
+ import { discoverForWallet } from '../services/claimScheduler.js';
+ 
+@@ -178,6 +180,33 @@ router.get('/:id/balance', async (req, res) => {
+     }
+ });
+ 
++// Transaction history for the wallet-detail view, one Horizon page at a time. Pass the
++// `nextCursor` this returns back in as `?cursor=` to page further back - repeat until
++// `nextCursor` comes back null, which means you've reached this account's very first
++// operation (its creation). Normalized shape (see lib/stellar.js) so the frontend never
++// has to understand Horizon's per-operation-type schema.
++router.get('/:id/operations', async (req, res) => {
++    const wallet = await Wallet.findById(req.params.id);
++    if (!wallet) return res.status(404).json({ error: 'Not found' });
++
++    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
++    const cursor = req.query.cursor || undefined;
++
++    try {
++        const records = await getRecentOperations(wallet.publicKey, limit, cursor);
++        const operations = normalizeOperations(records, wallet.publicKey);
++        const nextCursor = records.length === limit ? records[records.length - 1].paging_token : null;
++        res.json({ operations, nextCursor });
++    } catch (err) {
++        // A brand-new, never-activated account 404s on Horizon - that's "no transactions
++        // yet", not an error the dashboard should alarm about.
++        if (err.response?.status === 404) {
++            return res.json({ operations: [], nextCursor: null });
++        }
++        res.status(502).json({ error: 'Failed to fetch transaction history from Horizon', detail: err.message });
++    }
++});
++
+ // Manual, synchronous "check now" - returns a real answer immediately (found N, or the
+ // exact error) instead of waiting on the background poll and checking a different tab.
+ router.post('/:id/check-claimable', async (req, res) => {

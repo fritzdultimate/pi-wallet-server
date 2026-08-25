@@ -19,6 +19,8 @@ import {
     getAccount,
     getNativeBalance,
     getMinAccountReservePi,
+    getRecentOperations,
+    normalizeOperations,
 } from '../lib/stellar.js';
 import { discoverForWallet } from '../services/claimScheduler.js';
 
@@ -175,6 +177,33 @@ router.get('/:id/balance', async (req, res) => {
         res.json({ balance, reservedPi, spendablePi });
     } catch (err) {
         res.status(502).json({ error: 'Failed to fetch balance from Horizon', detail: err.message });
+    }
+});
+
+// Transaction history for the wallet-detail view, one Horizon page at a time. Pass the
+// `nextCursor` this returns back in as `?cursor=` to page further back - repeat until
+// `nextCursor` comes back null, which means you've reached this account's very first
+// operation (its creation). Normalized shape (see lib/stellar.js) so the frontend never
+// has to understand Horizon's per-operation-type schema.
+router.get('/:id/operations', async (req, res) => {
+    const wallet = await Wallet.findById(req.params.id);
+    if (!wallet) return res.status(404).json({ error: 'Not found' });
+
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 20));
+    const cursor = req.query.cursor || undefined;
+
+    try {
+        const records = await getRecentOperations(wallet.publicKey, limit, cursor);
+        const operations = normalizeOperations(records, wallet.publicKey);
+        const nextCursor = records.length === limit ? records[records.length - 1].paging_token : null;
+        res.json({ operations, nextCursor });
+    } catch (err) {
+        // A brand-new, never-activated account 404s on Horizon - that's "no transactions
+        // yet", not an error the dashboard should alarm about.
+        if (err.response?.status === 404) {
+            return res.json({ operations: [], nextCursor: null });
+        }
+        res.status(502).json({ error: 'Failed to fetch transaction history from Horizon', detail: err.message });
     }
 });
 
