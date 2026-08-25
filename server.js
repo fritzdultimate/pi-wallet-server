@@ -45,7 +45,7 @@ app.get('/', (req, res) => {
 
 app.use('/api/auth', authRoutes);
 
-// Everything below this line requires the owner's JWT.
+// Everything below this line requires the owner's JWT
 app.use('/api/wallets', requireAuth, walletRoutes);
 app.use('/api/claims', requireAuth, claimRoutes);
 app.use('/api/settings', requireAuth, settingsRoutes);
