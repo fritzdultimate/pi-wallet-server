@@ -54,9 +54,28 @@ const SettingsSchema = new mongoose.Schema({
     sweepEnabled: { type: Boolean, default: false },
     sweepIntervalMs: { type: Number, default: 5 * 60_000 },
     sweepBatchSize: { type: Number, default: 10 },
-    // Leave at least this much Pi behind in a swept wallet (covers Stellar's minimum
-    // account reserve so the sweep never fails by trying to drain an account to zero).
-    sweepReserveMinimum: { type: Number, default: 1 },
+    // Leave at least this much Pi behind in any wallet this server debits on its own -
+    // continuous sweep (services/sweeper.js) AND sponsor/funder pre-funding
+    // (services/funderPrefund.js) both apply this. It exists so YOU can deliberately
+    // leave extra headroom above the bare protocol minimum (e.g. for a future fee spike).
+    // It is a FLOOR on top of, never a replacement for, the actual per-account protocol
+    // minimum balance - both services also independently compute each account's real
+    // requirement live (getMinAccountReservePi in lib/stellar.js, which accounts for
+    // extra subentries like a co-signer) and use whichever number is larger. Pi Network's
+    // bare minimum for a plain, no-subentry account is ~0.98 Pi - if you saw sweeps fail
+    // and burn fees trying to drain a wallet below that, this is the setting (and the
+    // now-automatic protocol-floor check) that fixes it.
+    sweepReserveMinimum: { type: Number, default: 0.98 },
+
+    // "Flood"/race a due claim across this many DIFFERENT funder (sponsor) wallets at
+    // once, each submitting its own claim-and-forward transaction for the SAME claimable
+    // balance concurrently. Only one can ever actually land (the claim is consumed
+    // atomically on-chain, so the rest simply fail once it's gone) - the point is to beat
+    // Pi mainnet congestion at unlock time by giving the claim several independent shots
+    // at ledger inclusion instead of just one. 1 = old single-sponsor behavior (no flood).
+    // Capped at 20 to keep a single misconfiguration from burning your whole funder pool
+    // on one claim.
+    claimSponsorFanout: { type: Number, default: 1, min: 1, max: 20 },
 
     telegramAlertsEnabled: { type: Boolean, default: false },
 }, {

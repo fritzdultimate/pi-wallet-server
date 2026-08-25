@@ -18,6 +18,7 @@ import {
     detectCredentialType,
     getAccount,
     getNativeBalance,
+    getMinAccountReservePi,
 } from '../lib/stellar.js';
 import { discoverForWallet } from '../services/claimScheduler.js';
 
@@ -117,12 +118,22 @@ router.get('/', async (req, res) => {
     ]);
     const statsByWallet = Object.fromEntries(stats.map((s) => [String(s._id), s]));
 
+    const settings = await Settings.getSingleton();
+    const configuredReserveMinimum = settings.sweepReserveMinimum || 0;
+
     res.json(wallets.map((w) => {
         const s = statsByWallet[String(w._id)];
+        const balance = w.lastBalance != null ? parseFloat(w.lastBalance) : null;
         return {
             ...w,
             claimableCount: s?.count || 0,
             claimablePiTotal: s?.totalPi || 0,
+            // Best-effort estimate from the LAST checked balance/subentry count, not a
+            // live Horizon call (this list endpoint stays cheap) - accurate as of
+            // lastCheckedAt. "Refresh" (GET /:id/balance below) recomputes it live and is
+            // what sweeper.js/funderPrefund.js actually rely on at spend time.
+            reservedPi: configuredReserveMinimum,
+            spendablePi: balance != null ? Math.max(0, balance - configuredReserveMinimum) : null,
         };
     }));
 });
@@ -146,11 +157,22 @@ router.get('/:id/balance', async (req, res) => {
 
     try {
         const accountData = await getAccount(wallet.publicKey);
-        const balance = getNativeBalance(accountData).toString();
+        const liveBalance = getNativeBalance(accountData);
+        const balance = liveBalance.toString();
         wallet.lastBalance = balance;
         wallet.lastCheckedAt = new Date();
         await wallet.save();
-        res.json({ balance });
+
+        // Live, protocol-accurate reserve (accounts for this wallet's actual subentry
+        // count - e.g. an extra co-signer) - the same number sweeper.js/funderPrefund.js
+        // use, whichever is larger than the configured buffer. Surfaced here so the
+        // dashboard can show real reserved-vs-spendable, not a flat guess.
+        const settings = await Settings.getSingleton();
+        const protocolMinReserve = await getMinAccountReservePi(accountData);
+        const reservedPi = Math.max(settings.sweepReserveMinimum || 0, protocolMinReserve);
+        const spendablePi = Math.max(0, liveBalance - reservedPi);
+
+        res.json({ balance, reservedPi, spendablePi });
     } catch (err) {
         res.status(502).json({ error: 'Failed to fetch balance from Horizon', detail: err.message });
     }

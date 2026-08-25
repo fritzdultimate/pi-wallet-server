@@ -1,0 +1,600 @@
+diff --git a/lib/stellar.js b/lib/stellar.js
+index 3705cfa..15aa774 100644
+--- a/lib/stellar.js
++++ b/lib/stellar.js
+@@ -105,6 +105,59 @@ export function getNativeBalance(accountData) {
+     return entry ? parseFloat(entry.balance) : 0;
+ }
+ 
++let cachedBaseReserve = null;
++let cachedBaseReserveAt = 0;
++const BASE_RESERVE_CACHE_TTL_MS = 5 * 60_000; // this is a protocol/network constant - changes essentially never
++
++// Conservative fallback if Horizon is briefly unreachable: matches the ~0.98 Pi minimum
++// balance on a plain (0-subentry) Pi Network account that prompted this fix in the first
++// place (0.98 / 2 entries = 0.49 Pi base reserve per entry).
++const FALLBACK_BASE_RESERVE_STROOPS = 4_900_000;
++
++/**
++ * Live "base reserve" (in stroops) from the most recent ledger. This is the per-entry
++ * unit the protocol uses to compute an account's minimum required balance - see
++ * getMinAccountReservePi() below. Cached briefly since it is effectively constant.
++ */
++export async function getBaseReserveStroops() {
++    const now = Date.now();
++    if (cachedBaseReserve && now - cachedBaseReserveAt < BASE_RESERVE_CACHE_TTL_MS) return cachedBaseReserve;
++
++    try {
++        const res = await axios.get(`${horizonUrl()}/ledgers`, {
++            params: { order: 'desc', limit: 1 },
++            timeout: 10_000,
++        });
++        const ledger = res.data?._embedded?.records?.[0];
++        const value = Number(ledger?.base_reserve_in_stroops);
++        cachedBaseReserve = Number.isFinite(value) && value > 0 ? value : FALLBACK_BASE_RESERVE_STROOPS;
++        cachedBaseReserveAt = now;
++        return cachedBaseReserve;
++    } catch {
++        return FALLBACK_BASE_RESERVE_STROOPS;
++    }
++}
++
++/**
++ * The PROTOCOL-required minimum balance (in Pi) for THIS SPECIFIC account, right now -
++ * not a guessed constant. Every Stellar/Pi account must keep at least
++ * (2 + subentry_count + num_sponsoring - num_sponsored) * base_reserve on hand; that
++ * "2 + subentries" bit is exactly why a flat 0.98 Pi guess (correct for a brand-new,
++ * 0-subentry account) can silently stop being enough - e.g. once a wallet gets a second
++ * signer via the co-sign feature (routes/cosign.js), it gains a subentry and its true
++ * minimum balance rises above 0.98. Anything that debits a wallet (sweeper.js,
++ * funderPrefund.js) should compare against this, not a hardcoded/settings-only number,
++ * so it never builds a transaction that Horizon is guaranteed to reject/underfund.
++ */
++export async function getMinAccountReservePi(accountData) {
++    const baseReserveStroops = await getBaseReserveStroops();
++    const subentries = Number(accountData?.subentry_count || 0);
++    const numSponsoring = Number(accountData?.num_sponsoring || 0);
++    const numSponsored = Number(accountData?.num_sponsored || 0);
++    const units = Math.max(0, 2 + subentries + numSponsoring - numSponsored);
++    return (units * baseReserveStroops) / 10_000_000;
++}
++
+ /** Extract the claimant predicate's "claimable at" time for a given public key, if any. */
+ export function findClaimableAt(record, publicKey) {
+     const claimant = (record.claimants || []).find((c) => c.destination === publicKey);
+diff --git a/models/Settings.js b/models/Settings.js
+index ace237c..c3795ed 100644
+--- a/models/Settings.js
++++ b/models/Settings.js
+@@ -54,9 +54,28 @@ const SettingsSchema = new mongoose.Schema({
+     sweepEnabled: { type: Boolean, default: false },
+     sweepIntervalMs: { type: Number, default: 5 * 60_000 },
+     sweepBatchSize: { type: Number, default: 10 },
+-    // Leave at least this much Pi behind in a swept wallet (covers Stellar's minimum
+-    // account reserve so the sweep never fails by trying to drain an account to zero).
+-    sweepReserveMinimum: { type: Number, default: 1 },
++    // Leave at least this much Pi behind in any wallet this server debits on its own -
++    // continuous sweep (services/sweeper.js) AND sponsor/funder pre-funding
++    // (services/funderPrefund.js) both apply this. It exists so YOU can deliberately
++    // leave extra headroom above the bare protocol minimum (e.g. for a future fee spike).
++    // It is a FLOOR on top of, never a replacement for, the actual per-account protocol
++    // minimum balance - both services also independently compute each account's real
++    // requirement live (getMinAccountReservePi in lib/stellar.js, which accounts for
++    // extra subentries like a co-signer) and use whichever number is larger. Pi Network's
++    // bare minimum for a plain, no-subentry account is ~0.98 Pi - if you saw sweeps fail
++    // and burn fees trying to drain a wallet below that, this is the setting (and the
++    // now-automatic protocol-floor check) that fixes it.
++    sweepReserveMinimum: { type: Number, default: 0.98 },
++
++    // "Flood"/race a due claim across this many DIFFERENT funder (sponsor) wallets at
++    // once, each submitting its own claim-and-forward transaction for the SAME claimable
++    // balance concurrently. Only one can ever actually land (the claim is consumed
++    // atomically on-chain, so the rest simply fail once it's gone) - the point is to beat
++    // Pi mainnet congestion at unlock time by giving the claim several independent shots
++    // at ledger inclusion instead of just one. 1 = old single-sponsor behavior (no flood).
++    // Capped at 20 to keep a single misconfiguration from burning your whole funder pool
++    // on one claim.
++    claimSponsorFanout: { type: Number, default: 1, min: 1, max: 20 },
+ 
+     telegramAlertsEnabled: { type: Boolean, default: false },
+ }, {
+diff --git a/routes/settings.js b/routes/settings.js
+index f4e2de3..b579862 100644
+--- a/routes/settings.js
++++ b/routes/settings.js
+@@ -12,7 +12,7 @@ router.get('/', async (req, res) => {
+ router.put('/', async (req, res) => {
+     const allowed = [
+         'destinationAddress', 'feeMode', 'extraFee', 'fixedFeePi', 'pollIntervalMs',
+-        'maxConcurrency', 'minFunderBalance', 'maxConcurrentClaims',
++        'maxConcurrency', 'minFunderBalance', 'maxConcurrentClaims', 'claimSponsorFanout',
+         'funderPrefundEnabled', 'funderLeadTimeMinutes',
+         'sweepEnabled', 'sweepIntervalMs', 'sweepBatchSize', 'sweepReserveMinimum',
+         'telegramAlertsEnabled',
+diff --git a/routes/wallets.js b/routes/wallets.js
+index ae0c8ac..c497783 100644
+--- a/routes/wallets.js
++++ b/routes/wallets.js
+@@ -18,6 +18,7 @@ import {
+     detectCredentialType,
+     getAccount,
+     getNativeBalance,
++    getMinAccountReservePi,
+ } from '../lib/stellar.js';
+ import { discoverForWallet } from '../services/claimScheduler.js';
+ 
+@@ -117,12 +118,22 @@ router.get('/', async (req, res) => {
+     ]);
+     const statsByWallet = Object.fromEntries(stats.map((s) => [String(s._id), s]));
+ 
++    const settings = await Settings.getSingleton();
++    const configuredReserveMinimum = settings.sweepReserveMinimum || 0;
++
+     res.json(wallets.map((w) => {
+         const s = statsByWallet[String(w._id)];
++        const balance = w.lastBalance != null ? parseFloat(w.lastBalance) : null;
+         return {
+             ...w,
+             claimableCount: s?.count || 0,
+             claimablePiTotal: s?.totalPi || 0,
++            // Best-effort estimate from the LAST checked balance/subentry count, not a
++            // live Horizon call (this list endpoint stays cheap) - accurate as of
++            // lastCheckedAt. "Refresh" (GET /:id/balance below) recomputes it live and is
++            // what sweeper.js/funderPrefund.js actually rely on at spend time.
++            reservedPi: configuredReserveMinimum,
++            spendablePi: balance != null ? Math.max(0, balance - configuredReserveMinimum) : null,
+         };
+     }));
+ });
+@@ -146,11 +157,22 @@ router.get('/:id/balance', async (req, res) => {
+ 
+     try {
+         const accountData = await getAccount(wallet.publicKey);
+-        const balance = getNativeBalance(accountData).toString();
++        const liveBalance = getNativeBalance(accountData);
++        const balance = liveBalance.toString();
+         wallet.lastBalance = balance;
+         wallet.lastCheckedAt = new Date();
+         await wallet.save();
+-        res.json({ balance });
++
++        // Live, protocol-accurate reserve (accounts for this wallet's actual subentry
++        // count - e.g. an extra co-signer) - the same number sweeper.js/funderPrefund.js
++        // use, whichever is larger than the configured buffer. Surfaced here so the
++        // dashboard can show real reserved-vs-spendable, not a flat guess.
++        const settings = await Settings.getSingleton();
++        const protocolMinReserve = await getMinAccountReservePi(accountData);
++        const reservedPi = Math.max(settings.sweepReserveMinimum || 0, protocolMinReserve);
++        const spendablePi = Math.max(0, liveBalance - reservedPi);
++
++        res.json({ balance, reservedPi, spendablePi });
+     } catch (err) {
+         res.status(502).json({ error: 'Failed to fetch balance from Horizon', detail: err.message });
+     }
+diff --git a/services/claimScheduler.js b/services/claimScheduler.js
+index d3b4ca1..0f61a88 100644
+--- a/services/claimScheduler.js
++++ b/services/claimScheduler.js
+@@ -5,15 +5,29 @@
+ //     balances exist for it, and record any new ones. destination is always resolved
+ //     from Settings.destinationAddress here - it is never taken from a request body.
+ //  2. processDueClaims() - for balances whose claimableAt has passed, actually build,
+-//     sign (main wallet + a funder wallet to cover fees), and submit the claim.
++//     sign, and submit the claim - racing it across settings.claimSponsorFanout DIFFERENT
++//     funder (sponsor) wallets at once when that's set above 1.
+ //
+ // processDueClaims() runs up to settings.maxConcurrentClaims DIFFERENT claims at once.
+-// Each claim is still only ever submitted once - this is throughput across distinct
+-// claims, not the old repo's "flood the same claim N times to win a race" pattern, which
+-// doesn't apply here anyway since you're the sole named claimant on your own balances.
+-// Claims sharing a funder wallet are serialized relative to each other via
++// Within EACH of those claims, processOneClaim() now submits the SAME claim-and-forward
++// transaction concurrently from settings.claimSponsorFanout different funder wallets (the
++// "flood"/spam behavior from the old bot) - each funder pays its own fee and races the
++// others to get the claim included. Only one can ever actually succeed on-chain: claiming
++// a claimable balance consumes it atomically, so whichever sponsor's transaction lands
++// first wins and every other sponsor's attempt then fails harmlessly (the balance is
++// simply gone by the time theirs is applied). The point isn't racing another claimant -
++// you're the sole named claimant on your own balances - it's beating Pi mainnet
++// congestion at unlock time, when huge numbers of unrelated wallets are all trying to
++// claim in the same few ledgers: one shot at inclusion can lose to a full ledger or a
++// dropped submission, several independent shots from different accounts (so they don't
++// collide on sequence numbers) meaningfully raise the odds one of them lands quickly.
++// claimSponsorFanout defaults to 1 (single sponsor, no flood) - set it in Settings to use
++// more.
++//
++// Claims sharing a funder wallet are still serialized relative to each other via
+ // runSerializedByKey(), because two transactions can't share one account's sequence
+-// number at the same time - only claims using DIFFERENT funders truly run in parallel.
++// number at the same time - only work on DIFFERENT funders truly runs in parallel, both
++// across distinct claims AND across one claim's own fanout attempts.
+ //
+ // Every attempt writes an AuditLog row, success or failure, no exceptions.
+ 
+@@ -39,21 +53,30 @@ import {
+ let discovering = false;
+ let processing = false;
+ 
+-async function pickFunder(minBalance) {
++/**
++ * Live-check funder wallets (highest cached balance first, since that's most likely to
++ * still qualify) and return up to `count` distinct ones with at least `minBalance` Pi
++ * right now. Stops as soon as it has enough - with few funders this checks all of them
++ * (same as the old single-funder pickFunder ever did), with many it doesn't bother
++ * checking every last one once enough eligible sponsors are already found.
++ */
++async function pickFunders(minBalance, count) {
+     const funders = await Wallet.find({ role: 'funder' }).sort({ lastBalance: -1 });
++    const eligible = [];
+     for (const funder of funders) {
++        if (eligible.length >= count) break;
+         try {
+             const accountData = await getAccount(funder.publicKey);
+             const balance = getNativeBalance(accountData);
+             funder.lastBalance = balance.toString();
+             funder.lastCheckedAt = new Date();
+             await funder.save();
+-            if (balance >= minBalance) return funder;
++            if (balance >= minBalance) eligible.push(funder);
+         } catch {
+             // unreachable/unactivated funder - skip it
+         }
+     }
+-    return null;
++    return eligible;
+ }
+ 
+ /**
+@@ -139,23 +162,13 @@ export async function discoverClaimables() {
+     }
+ }
+ 
+-async function processOneClaim(claim, settings) {
+-    const funder = await pickFunder(settings.minFunderBalance || 1);
+-    if (!funder) {
+-        await AuditLog.create({
+-            action: 'claim_skipped_no_funder',
+-            level: 'warn',
+-            detail: `No funder wallet with sufficient balance to cover fees for ${claim.balanceId}`,
+-        });
+-        return;
+-    }
+-
+-    // Everything from here on touches `funder`'s sequence number - serialize against any
+-    // other claim currently using the same funder, so they never collide.
+-    await runSerializedByKey(String(funder._id), async () => {
+-        claim.status = 'claiming';
+-        await claim.save();
+-
++/**
++ * One sponsor's single attempt at claiming `claim`, fully serialized against any other
++ * claim currently using this same funder (shared sequence number). Never throws - always
++ * resolves to { funder, result } so Promise.allSettled callers can inspect every attempt.
++ */
++async function attemptClaimWithFunder(claim, funder, feePerOperationStroops) {
++    return runSerializedByKey(String(funder._id), async () => {
+         try {
+             const mainWalletFull = await Wallet.findById(claim.walletId._id).select('+credentialEncrypted');
+             const funderWalletFull = await Wallet.findById(funder._id).select('+credentialEncrypted');
+@@ -169,12 +182,6 @@ async function processOneClaim(claim, settings) {
+                 funderWalletFull.credentialType
+             );
+ 
+-            const feePerOperationStroops = await resolveFeePerOperationStroops({
+-                feeMode: settings.feeMode,
+-                extraFeePi: settings.extraFee,
+-                fixedFeePi: settings.fixedFeePi,
+-            });
+-
+             const xdr = await buildClaimAndForwardTx({
+                 mainKp,
+                 funderKp,
+@@ -188,42 +195,109 @@ async function processOneClaim(claim, settings) {
+ 
+             // We are the tx source (funder) - record the sequence we now expect, so
+             // walletMonitor.js can tell if this funder account moves outside of us.
+-            const freshFunder = await getAccount(funderKp.publicKey());
+-            funder.lastKnownSequence = freshFunder.sequence;
+-            await funder.save();
+-
+-            if (result.success && result.hash) {
+-                claim.status = 'claimed';
+-                claim.txHash = result.hash;
+-                claim.claimedAt = new Date();
+-                await AuditLog.create({
+-                    walletId: claim.walletId._id,
+-                    action: 'claim_succeeded',
+-                    detail: `Claimed ${claim.amount} Pi -> ${claim.destination}. Hash: ${result.hash}`,
+-                });
+-            } else {
+-                claim.status = 'failed';
+-                claim.lastError = JSON.stringify(result.reason || result.message || 'unknown error');
+-                await AuditLog.create({
+-                    walletId: claim.walletId._id,
+-                    action: 'claim_failed',
+-                    level: 'error',
+-                    detail: claim.lastError,
+-                });
++            try {
++                const freshFunder = await getAccount(funderKp.publicKey());
++                funder.lastKnownSequence = freshFunder.sequence;
++                await funder.save();
++            } catch {
++                // best-effort bookkeeping only - a failure here shouldn't mask the claim result
+             }
+-            await claim.save();
++
++            await AuditLog.create({
++                walletId: claim.walletId._id,
++                action: result.success ? 'claim_attempt_succeeded' : 'claim_attempt_failed',
++                level: result.success ? 'info' : 'warn',
++                detail: `[sponsor "${funder.label}"] ` + (result.success
++                    ? `Claimed ${claim.amount} Pi -> ${claim.destination}. Hash: ${result.hash}`
++                    : JSON.stringify(result.reason || result.message || 'unknown error')),
++            });
++
++            return { funder, result };
+         } catch (err) {
++            await AuditLog.create({
++                walletId: claim.walletId._id,
++                action: 'claim_attempt_failed',
++                level: 'warn',
++                detail: `[sponsor "${funder.label}"] ${err.message}`,
++            });
++            return { funder, result: { success: false, message: err.message } };
++        }
++    });
++}
++
++async function processOneClaim(claim, settings) {
++    const fanout = Math.max(1, Math.min(settings.claimSponsorFanout || 1, 20));
++    const funders = await pickFunders(settings.minFunderBalance || 1, fanout);
++    if (!funders.length) {
++        await AuditLog.create({
++            action: 'claim_skipped_no_funder',
++            level: 'warn',
++            detail: `No funder wallet with sufficient balance to cover fees for ${claim.balanceId}`,
++        });
++        return;
++    }
++
++    claim.status = 'claiming';
++    await claim.save();
++
++    const feePerOperationStroops = await resolveFeePerOperationStroops({
++        feeMode: settings.feeMode,
++        extraFeePi: settings.extraFee,
++        fixedFeePi: settings.fixedFeePi,
++    });
++
++    try {
++        // Fire the SAME claim at every selected sponsor concurrently (settings.claimSponsorFanout
++        // controls how many). Each goes through a DIFFERENT funder, so none of these
++        // collide on a shared sequence number - they genuinely race in parallel. Only one
++        // can ever actually consume the claimable balance on-chain; the rest simply lose
++        // the race and fail, which is expected and fine, not an error condition.
++        const settled = await Promise.allSettled(
++            funders.map((funder) => attemptClaimWithFunder(claim, funder, feePerOperationStroops))
++        );
++
++        const winner = settled.find(
++            (s) => s.status === 'fulfilled' && s.value.result.success && s.value.result.hash
++        );
++
++        if (winner) {
++            claim.status = 'claimed';
++            claim.txHash = winner.value.result.hash;
++            claim.claimedAt = new Date();
++            await AuditLog.create({
++                walletId: claim.walletId._id,
++                action: 'claim_succeeded',
++                detail: funders.length > 1
++                    ? `Claimed ${claim.amount} Pi -> ${claim.destination} via sponsor "${winner.value.funder.label}" (raced against ${funders.length - 1} other sponsor(s)). Hash: ${winner.value.result.hash}`
++                    : `Claimed ${claim.amount} Pi -> ${claim.destination}. Hash: ${winner.value.result.hash}`,
++            });
++        } else {
++            const reasons = settled.map((s) => (
++                s.status === 'fulfilled'
++                    ? (s.value.result.reason || s.value.result.message)
++                    : s.reason?.message
++            )).filter(Boolean);
+             claim.status = 'failed';
+-            claim.lastError = err.message;
+-            await claim.save();
++            claim.lastError = JSON.stringify(reasons.length ? reasons : 'unknown error');
+             await AuditLog.create({
+                 walletId: claim.walletId._id,
+                 action: 'claim_failed',
+                 level: 'error',
+-                detail: err.message,
++                detail: claim.lastError,
+             });
+         }
+-    });
++        await claim.save();
++    } catch (err) {
++        claim.status = 'failed';
++        claim.lastError = err.message;
++        await claim.save();
++        await AuditLog.create({
++            walletId: claim.walletId._id,
++            action: 'claim_failed',
++            level: 'error',
++            detail: err.message,
++        });
++    }
+ }
+ 
+ export async function processDueClaims() {
+diff --git a/services/funderPrefund.js b/services/funderPrefund.js
+index 3cfbdcb..4c3479c 100644
+--- a/services/funderPrefund.js
++++ b/services/funderPrefund.js
+@@ -18,6 +18,7 @@ import {
+     buildPaymentTx,
+     submitTransaction,
+     resolveFeePerOperationStroops,
++    getMinAccountReservePi,
+ } from '../lib/stellar.js';
+ 
+ let running = false;
+@@ -37,8 +38,8 @@ export async function prefundFunders() {
+         });
+         if (!upcomingCount) return; // nothing due soon enough to warrant topping up
+ 
+-        const reserves = await Wallet.find({ role: 'reserve' }).sort({ lastBalance: -1 });
+-        if (!reserves.length) {
++        const reserveWallets = await Wallet.find({ role: 'reserve' });
++        if (!reserveWallets.length) {
+             await AuditLog.create({
+                 action: 'prefund_skipped_no_reserve',
+                 level: 'warn',
+@@ -47,6 +48,47 @@ export async function prefundFunders() {
+             return;
+         }
+ 
++        const feePerOperationStroops = await resolveFeePerOperationStroops({
++            feeMode: settings.feeMode,
++            extraFeePi: settings.extraFee,
++            fixedFeePi: settings.fixedFeePi,
++        });
++        const feePi = feePerOperationStroops / 10_000_000;
++        const configuredReserveMinimum = settings.sweepReserveMinimum || 0;
++
++        // Refresh every reserve wallet's LIVE balance up front - `lastBalance` on the
++        // Wallet doc can be stale for a long time (reserve wallets are never touched by
++        // the funders-refresh loop below, only by this job and manual dashboard checks),
++        // so selecting a "spare" reserve off a stale cached number is exactly how you'd
++        // end up trying to send more than a reserve actually still holds. This also
++        // computes each reserve's real protocol minimum (getMinAccountReservePi), so a
++        // reserve that has picked up extra subentries since it was last checked is still
++        // respected. `spare` tracks a live, IN-MEMORY running balance for this one run,
++        // decremented after every successful spend, so two funders topped up back-to-back
++        // in the same run never both draw against the same stale reserve balance.
++        const reserves = [];
++        for (const wallet of reserveWallets) {
++            try {
++                const accountData = await getAccount(wallet.publicKey);
++                const liveBalance = getNativeBalance(accountData);
++                const protocolMinReserve = await getMinAccountReservePi(accountData);
++                const reserveMinimum = Math.max(configuredReserveMinimum, protocolMinReserve);
++
++                wallet.lastBalance = liveBalance.toString();
++                wallet.lastCheckedAt = new Date();
++                await wallet.save();
++
++                reserves.push({
++                    wallet,
++                    reserveMinimum,
++                    spare: liveBalance - reserveMinimum, // never touch this wallet's own protected floor
++                });
++            } catch {
++                // reserve wallet unreachable/unactivated - nothing to spend from right now
++            }
++        }
++        reserves.sort((a, b) => b.spare - a.spare);
++
+         const funders = await Wallet.find({ role: 'funder' });
+         const target = settings.minFunderBalance || 1;
+ 
+@@ -64,46 +106,50 @@ export async function prefundFunders() {
+ 
+             if (balance >= target) continue;
+ 
+-            const topUpAmount = (target - balance).toFixed(7);
+-            const reserve = reserves.find((r) => parseFloat(r.lastBalance || '0') > Number(topUpAmount) + (settings.sweepReserveMinimum || 1));
+-            if (!reserve) {
++            const topUpAmount = Number((target - balance).toFixed(7));
++            // A reserve pays its OWN fee on top of the amount it sends (buildPaymentTx:
++            // the reserve wallet is the tx source) - so the spend that actually needs to
++            // fit under its protected floor is topUpAmount + feePi, not just topUpAmount.
++            const candidate = reserves.find((r) => r.spare >= topUpAmount + feePi);
++            if (!candidate) {
+                 await AuditLog.create({
+                     walletId: funder._id,
+                     action: 'prefund_skipped_insufficient_reserve',
+                     level: 'warn',
+-                    detail: `Funder "${funder.label}" needs ${topUpAmount} Pi but no reserve wallet has enough spare balance`,
++                    detail: `Funder "${funder.label}" needs ${topUpAmount} Pi (+ ~${feePi.toFixed(7)} Pi fee) but no reserve wallet has that much spare balance above its own protocol/configured reserve floor`,
+                 });
+                 continue;
+             }
+ 
+-            await runSerializedByKey(String(reserve._id), async () => {
++            await runSerializedByKey(String(candidate.wallet._id), async () => {
+                 try {
+-                    const reserveWalletFull = await Wallet.findById(reserve._id).select('+credentialEncrypted');
++                    const reserveWalletFull = await Wallet.findById(candidate.wallet._id).select('+credentialEncrypted');
+                     const reserveKp = getKeypairFromCredential(
+                         decryptSecret(reserveWalletFull.credentialEncrypted),
+                         reserveWalletFull.credentialType
+                     );
+ 
+-                    const feePerOperationStroops = await resolveFeePerOperationStroops({
+-                        feeMode: settings.feeMode,
+-                        extraFeePi: settings.extraFee,
+-                        fixedFeePi: settings.fixedFeePi,
+-                    });
+-
+                     const xdr = await buildPaymentTx({
+                         fromKp: reserveKp,
+                         destination: funder.publicKey,
+-                        amount: topUpAmount,
++                        amount: topUpAmount.toFixed(7),
+                         feePerOperationStroops,
+                     });
+                     const result = await submitTransaction(xdr);
+ 
++                    if (result.success) {
++                        // Reflect the spend immediately so the NEXT funder in this same
++                        // run sees this reserve's true remaining spare balance instead of
++                        // the pre-spend snapshot.
++                        candidate.spare -= (topUpAmount + feePi);
++                    }
++
+                     await AuditLog.create({
+                         walletId: funder._id,
+                         action: result.success ? 'funder_prefunded' : 'funder_prefund_failed',
+                         level: result.success ? 'info' : 'error',
+                         detail: result.success
+-                            ? `Topped up "${funder.label}" with ${topUpAmount} Pi from "${reserve.label}" (${leadTimeMs / 60_000} min lead time). Hash: ${result.hash}`
++                            ? `Topped up "${funder.label}" with ${topUpAmount} Pi from "${candidate.wallet.label}" (${leadTimeMs / 60_000} min lead time, leaving ${candidate.wallet.label} with >= ${candidate.reserveMinimum.toFixed(7)} Pi reserved). Hash: ${result.hash}`
+                             : JSON.stringify(result.reason || result.message),
+                     });
+                 } catch (err) {
+diff --git a/services/sweeper.js b/services/sweeper.js
+index 0008793..8112095 100644
+--- a/services/sweeper.js
++++ b/services/sweeper.js
+@@ -18,6 +18,7 @@ import {
+     buildPaymentTx,
+     submitTransaction,
+     resolveFeePerOperationStroops,
++    getMinAccountReservePi,
+ } from '../lib/stellar.js';
+ 
+ let running = false;
+@@ -43,7 +44,7 @@ export async function sweepWallets() {
+             fixedFeePi: settings.fixedFeePi,
+         });
+         const feePi = feePerOperationStroops / 10_000_000;
+-        const reserveMinimum = settings.sweepReserveMinimum || 1;
++        const configuredReserveMinimum = settings.sweepReserveMinimum || 0;
+ 
+         const limit = pLimit(settings.maxConcurrency || 5);
+ 
+@@ -54,6 +55,14 @@ export async function sweepWallets() {
+                 wallet.lastBalance = balance.toString();
+                 wallet.lastCheckedAt = new Date();
+ 
++                // Never sweep below what the PROTOCOL actually requires this account to
++                // keep - not just whatever the configured buffer happens to be. Take
++                // whichever is larger, so a wallet with extra subentries (e.g. a co-signer
++                // added via routes/cosign.js) is still protected even if the configured
++                // buffer was sized for a plain account.
++                const protocolMinReserve = await getMinAccountReservePi(accountData);
++                const reserveMinimum = Math.max(configuredReserveMinimum, protocolMinReserve);
++
+                 const withdrawable = balance - reserveMinimum - feePi;
+                 if (withdrawable <= 0) {
+                     await wallet.save();

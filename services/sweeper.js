@@ -18,6 +18,7 @@ import {
     buildPaymentTx,
     submitTransaction,
     resolveFeePerOperationStroops,
+    getMinAccountReservePi,
 } from '../lib/stellar.js';
 
 let running = false;
@@ -43,7 +44,7 @@ export async function sweepWallets() {
             fixedFeePi: settings.fixedFeePi,
         });
         const feePi = feePerOperationStroops / 10_000_000;
-        const reserveMinimum = settings.sweepReserveMinimum || 1;
+        const configuredReserveMinimum = settings.sweepReserveMinimum || 0;
 
         const limit = pLimit(settings.maxConcurrency || 5);
 
@@ -53,6 +54,14 @@ export async function sweepWallets() {
                 const balance = getNativeBalance(accountData);
                 wallet.lastBalance = balance.toString();
                 wallet.lastCheckedAt = new Date();
+
+                // Never sweep below what the PROTOCOL actually requires this account to
+                // keep - not just whatever the configured buffer happens to be. Take
+                // whichever is larger, so a wallet with extra subentries (e.g. a co-signer
+                // added via routes/cosign.js) is still protected even if the configured
+                // buffer was sized for a plain account.
+                const protocolMinReserve = await getMinAccountReservePi(accountData);
+                const reserveMinimum = Math.max(configuredReserveMinimum, protocolMinReserve);
 
                 const withdrawable = balance - reserveMinimum - feePi;
                 if (withdrawable <= 0) {

@@ -12,7 +12,7 @@ router.get('/', async (req, res) => {
 router.put('/', async (req, res) => {
     const allowed = [
         'destinationAddress', 'feeMode', 'extraFee', 'fixedFeePi', 'pollIntervalMs',
-        'maxConcurrency', 'minFunderBalance', 'maxConcurrentClaims',
+        'maxConcurrency', 'minFunderBalance', 'maxConcurrentClaims', 'claimSponsorFanout',
         'funderPrefundEnabled', 'funderLeadTimeMinutes',
         'sweepEnabled', 'sweepIntervalMs', 'sweepBatchSize', 'sweepReserveMinimum',
         'telegramAlertsEnabled',
